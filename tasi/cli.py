@@ -12,6 +12,8 @@ tasi/cli.py
     python -m tasi.cli backtest --max-bars 15
     python -m tasi.cli briefing
     python -m tasi.cli viability --capital 300
+    python -m tasi.cli scan --allow-uncalibrated
+    python -m tasi.cli preflight
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from typing import List, Optional, Sequence
 
 from . import backtest as bt
 from . import db
+from . import engine as eng
 from . import journal as jr
 from . import quality as ql
 from . import regime as rg
@@ -309,6 +312,56 @@ def cmd_viability(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def _build_engine(args: argparse.Namespace, conn):
+    from .providers.replay import ReplayProvider
+    from .notifier import TelegramNotifier
+
+    provider = ReplayProvider(conn)      # المزوّد الوحيد المتاح بلا اشتراك
+    risk = RiskManager(capital=args.capital, conn=conn)
+    return eng.Engine(
+        conn, provider, risk=risk,
+        notifier=TelegramNotifier(enabled=not args.no_telegram),
+        shariah_allow=args.allow or None, benchmark=args.benchmark,
+        allow_uncalibrated=args.allow_uncalibrated, min_score=args.min_score,
+    )
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    """افحص جاهزية النظام قبل الجلسة."""
+    conn = db.connect(args.db)
+    checks = _build_engine(args, conn).preflight(require_realtime=args.realtime)
+    print(json.dumps(checks, ensure_ascii=False, indent=2))
+    print()
+    if checks["ok"]:
+        print("النظام جاهز.")
+    else:
+        print(f"النظام غير جاهز. {len(checks['problems'])} عائق:")
+        for problem in checks["problems"]:
+            print(f"  - {problem}")
+    return 0 if checks["ok"] else 1
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    """شغّل دورة واحدة واعرض الاقتراحات."""
+    conn = db.connect(args.db)
+    engine = _build_engine(args, conn)
+
+    checks = engine.preflight()
+    if not checks["ok"] and not args.force:
+        print("النظام غير جاهز:", file=sys.stderr)
+        for problem in checks["problems"]:
+            print(f"  - {problem}", file=sys.stderr)
+        print("\nأضف --force للتشغيل رغم ذلك.", file=sys.stderr)
+        return 1
+
+    result = engine.run_cycle(symbols=args.symbols, dry_run=not args.emit)
+    print(engine.render_cycle_ar(result))
+    if result.proposals and not args.emit:
+        print("\n(عرض فقط. أضف --emit لتسجيل الإشارات وإرسال التنبيهات.)")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -376,6 +429,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--commission", type=float, default=0.155,
                    help="عمولة الوسيط بالنسبة المئوية لكل جهة")
     p.set_defaults(func=cmd_viability)
+
+    for name, helptext, func in (
+        ("preflight", "فحص جاهزية النظام قبل الجلسة", cmd_preflight),
+        ("scan", "دورة تحليل واحدة مع الاقتراحات", cmd_scan),
+    ):
+        p = sub.add_parser(name, help=helptext)
+        p.add_argument("--capital", type=float, default=100_000.0)
+        p.add_argument("--benchmark", default="TASI")
+        p.add_argument("--allow", nargs="*", default=None,
+                       help="التصنيفات الشرعية المسموحة، مثل: --allow PURE MIXED")
+        p.add_argument("--min-score", type=float, default=50.0, dest="min_score")
+        p.add_argument("--allow-uncalibrated", action="store_true",
+                       dest="allow_uncalibrated",
+                       help="اسمح بأنماط غير معايرة (للتجربة فقط)")
+        p.add_argument("--no-telegram", action="store_true", dest="no_telegram")
+        if name == "preflight":
+            p.add_argument("--realtime", action="store_true",
+                           help="اشترط مزوّداً لحظياً")
+        else:
+            p.add_argument("--symbols", nargs="*", default=None)
+            p.add_argument("--emit", action="store_true",
+                           help="سجّل الإشارات وأرسل التنبيهات")
+            p.add_argument("--force", action="store_true")
+        p.set_defaults(func=func)
 
     return parser
 
