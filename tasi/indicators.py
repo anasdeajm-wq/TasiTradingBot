@@ -1,6 +1,6 @@
 """
-indicators.py
-=============
+tasi/indicators.py
+==================
 حساب المؤشرات الفنية للسوق السعودي (تداول).
 
 Technical indicators implemented in pure Python (no pandas / numpy required),
@@ -11,6 +11,10 @@ so the bot runs on a bare Python 3.9+ install.
     - RSI                   (Wilder's smoothing, default period 14)
     - MACD                  (12, 26, 9)
     - Volume Ratio          (current volume / average volume of the PREVIOUS N bars)
+    - ATR                   (Average True Range - تقلب السهم، أساس وقف الخسارة)
+    - VWAP                  (متوسط السعر المرجح بالحجم - مرجع المضاربة اليومية)
+    - Bollinger Bands       (نطاقات التقلب)
+    - Momentum / ROC        (قوة الحركة)
 
 كل الدوال تستقبل قائمة من الأرقام (الأقدم أولاً) وتُرجع قائمة بنفس الطول،
 حيث تكون القيم غير المعرّفة (في بداية السلسلة) مساوية للقيمة None.
@@ -280,3 +284,135 @@ def compute_all(
     snapshot.avg_volume = vol_avg[last]
     snapshot.volume_ratio = vol_ratio[last]
     return snapshot
+
+
+# ---------------------------------------------------------------------------
+# مؤشرات المضاربة - intraday / speculation indicators
+# ---------------------------------------------------------------------------
+def true_range(highs: Sequence[float], lows: Sequence[float],
+               closes: Sequence[float]) -> List[Number]:
+    """المدى الحقيقي لكل شمعة - the raw input to ATR.
+
+    True range accounts for gaps: a stock that opened far from yesterday's
+    close has moved more than its own high-low span suggests.
+    """
+    out: List[Number] = [None] * len(closes)
+    for i in range(len(closes)):
+        if i == 0:
+            out[i] = highs[i] - lows[i]
+            continue
+        prev_close = closes[i - 1]
+        out[i] = max(
+            highs[i] - lows[i],
+            abs(highs[i] - prev_close),
+            abs(lows[i] - prev_close),
+        )
+    return out
+
+
+def atr(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float],
+        period: int = 14) -> List[Number]:
+    """متوسط المدى الحقيقي - Average True Range (Wilder's smoothing).
+
+    ATR is the honest way to place a stop: a fixed 2% stop is too tight for
+    a volatile name and too wide for a quiet one. Sizing off ATR makes the
+    risk per trade consistent across very different stocks.
+    """
+    tr = true_range(highs, lows, closes)
+    out: List[Number] = [None] * len(closes)
+    if len(closes) <= period:
+        return out
+
+    seed = sum(v for v in tr[1:period + 1] if v is not None) / period
+    out[period] = seed
+    previous = seed
+    for i in range(period + 1, len(closes)):
+        current = tr[i] or 0.0
+        previous = (previous * (period - 1) + current) / period
+        out[i] = previous
+    return out
+
+
+def vwap(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float],
+         volumes: Sequence[float]) -> List[Number]:
+    """السعر المتوسط المرجح بالحجم - cumulative VWAP over the given bars.
+
+    Intended for a single session's intraday bars: pass one day's bars and
+    the series resets naturally. Institutions benchmark fills against VWAP,
+    so price relative to it is a genuine intraday reference.
+    """
+    out: List[Number] = []
+    cum_pv = 0.0
+    cum_vol = 0.0
+    for high, low, close, volume in zip(highs, lows, closes, volumes):
+        typical = (high + low + close) / 3.0
+        cum_pv += typical * volume
+        cum_vol += volume
+        out.append(cum_pv / cum_vol if cum_vol else None)
+    return out
+
+
+def bollinger(values: Sequence[float], period: int = 20,
+              num_std: float = 2.0) -> Dict[str, List[Number]]:
+    """نطاقات بولنجر - middle band plus/minus `num_std` standard deviations."""
+    middle = sma(values, period)
+    upper: List[Number] = [None] * len(values)
+    lower: List[Number] = [None] * len(values)
+    width: List[Number] = [None] * len(values)
+
+    for i in range(period - 1, len(values)):
+        window = values[i - period + 1:i + 1]
+        mean = middle[i]
+        if mean is None:
+            continue
+        variance = sum((v - mean) ** 2 for v in window) / period
+        std = variance ** 0.5
+        upper[i] = mean + num_std * std
+        lower[i] = mean - num_std * std
+        width[i] = (upper[i] - lower[i]) / mean if mean else None
+
+    return {"middle": middle, "upper": upper, "lower": lower, "width": width}
+
+
+def roc(values: Sequence[float], period: int = 10) -> List[Number]:
+    """معدل التغير - Rate of Change as a percentage over `period` bars."""
+    out: List[Number] = [None] * len(values)
+    for i in range(period, len(values)):
+        past = values[i - period]
+        if past:
+            out[i] = (values[i] - past) / past * 100.0
+    return out
+
+
+def relative_strength(values: Sequence[float], benchmark: Sequence[float],
+                      period: int = 20) -> List[Number]:
+    """القوة النسبية مقابل المؤشر - stock performance minus index performance.
+
+    Positive means the stock outpaced TASI over the window. This is what
+    separates a name that is merely rising with the market from one that is
+    genuinely leading it.
+    """
+    stock_roc = roc(values, period)
+    index_roc = roc(benchmark, period)
+    return [
+        None if (s is None or b is None) else s - b
+        for s, b in zip(stock_roc, index_roc)
+    ]
+
+
+def realized_volatility(values: Sequence[float], period: int = 20) -> List[Number]:
+    """التقلب المحقق - standard deviation of returns, annualised on 252 days."""
+    returns: List[Number] = [None] * len(values)
+    for i in range(1, len(values)):
+        if values[i - 1]:
+            returns[i] = (values[i] - values[i - 1]) / values[i - 1]
+
+    out: List[Number] = [None] * len(values)
+    for i in range(period, len(values)):
+        window = [r for r in returns[i - period + 1:i + 1] if r is not None]
+        if len(window) < period // 2:
+            continue
+        mean = sum(window) / len(window)
+        variance = sum((r - mean) ** 2 for r in window) / len(window)
+        out[i] = (variance ** 0.5) * (252 ** 0.5) * 100.0
+    return out
