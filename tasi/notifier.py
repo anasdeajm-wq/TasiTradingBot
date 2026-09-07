@@ -1,6 +1,6 @@
 """
-telegram_notifier.py
-====================
+tasi/notifier.py
+================
 إرسال التنبيهات عبر تيليجرام - Telegram alerts for every BUY / SELL signal.
 
 الإعداد - configuration via environment variables:
