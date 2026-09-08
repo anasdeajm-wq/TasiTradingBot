@@ -88,6 +88,30 @@ def cmd_universe_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_names_import(args: argparse.Namespace) -> int:
+    """أضف الأسماء العربية دون المساس ببقية حقول الشركة."""
+    conn = db.connect(args.db)
+    updated = missing = 0
+    with open(args.path, newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            symbol = u.normalize_symbol(row.get("symbol", ""))
+            name = (row.get("name_ar") or "").strip()
+            if not symbol or not name:
+                continue
+            company = u.get_company(conn, symbol)
+            if not company:
+                missing += 1
+                continue
+            company.name_ar = name
+            u.upsert_companies(conn, [company])
+            updated += 1
+    print(f"تم تحديث {updated} اسماً.")
+    if missing:
+        print(f"{missing} رمزاً غير موجود في قاعدة البيانات "
+              "(شغّل universe-discover أولاً).")
+    return 0
+
+
 def cmd_shariah_template(args: argparse.Namespace) -> int:
     """أنشئ ملف CSV فارغاً بأرقام الشركات المعروفة ليُملأ يدوياً."""
     conn = db.connect(args.db)
@@ -728,6 +752,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("universe-import", help="استيراد قائمة الشركات من CSV")
     p.add_argument("path")
     p.set_defaults(func=cmd_universe_import)
+
+    p = sub.add_parser("names-import", help="استيراد الأسماء العربية")
+    p.add_argument("path")
+    p.set_defaults(func=cmd_names_import)
 
     p = sub.add_parser("shariah-template", help="إنشاء قالب CSV للتصنيف الشرعي")
     p.add_argument("--out", default="shariah_template.csv")
