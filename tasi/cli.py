@@ -30,7 +30,9 @@ from . import backtest as bt
 from . import db
 from . import engine as eng
 from . import forward as fw
+from . import fundamentals as fu
 from . import journal as jr
+from . import paper as pp
 from . import momentum as mo
 from . import quality as ql
 from . import regime as rg
@@ -740,6 +742,151 @@ def cmd_momentum(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_fundamentals(args: argparse.Namespace) -> int:
+    """اجلب القوائم المالية أو اعرض فحص الجودة."""
+    conn = db.connect(args.db)
+    fu.ensure_schema(conn)
+
+    if args.fetch:
+        symbols = args.symbols or [s for s in u.all_symbols(conn) if s != "TASI"]
+        print(f"جلب القوائم المالية لـ {len(symbols)} شركة...\n")
+        results = fu.fetch_many(
+            conn, symbols,
+            on_progress=lambda i, n, ok: print(f"  {i}/{n} · بيانات لـ {ok}"))
+        ok = sum(1 for v in results.values() if v)
+        print(f"\n{ok} شركة لها بيانات | {sum(results.values()):,} قيمة مخزّنة")
+        return 0
+
+    symbols = args.symbols
+    if not symbols:
+        picks = mo.current_picks(conn, args.lookback, args.hold, args.min_turnover)
+        symbols = [h.symbol for h in picks]
+    if not symbols:
+        print("لا توجد رموز للفحص.", file=sys.stderr)
+        return 1
+
+    rows = []
+    passed = []
+    for symbol in symbols:
+        quality = fu.score(conn, symbol)
+        company = u.get_company(conn, symbol)
+        name = ((company.name_ar or company.name_en or "") if company else "")[:20]
+        if not quality.has_enough_data:
+            rows.append([symbol, name, "—", "—", "—", "؟", "بيانات غير كافية"])
+            continue
+        reasons = quality.failures(max_debt_to_equity=args.max_debt)
+        if not reasons:
+            passed.append(symbol)
+        rows.append([
+            symbol, name,
+            f"{quality.net_margin:.1%}" if quality.net_margin is not None else "—",
+            f"{quality.debt_to_equity:.2f}" if quality.debt_to_equity is not None else "—",
+            f"{quality.current_ratio:.2f}" if quality.current_ratio is not None else "—",
+            "✓" if not reasons else "✗",
+            " | ".join(reasons[:2]),
+        ])
+    _print_table(rows, ["الرمز", "الشركة", "هامش صافي", "دين/ملكية",
+                        "نسبة جارية", "الحكم", "السبب"])
+    print(f"\nاجتاز {len(passed)} من {len(symbols)}"
+          + (f": {', '.join(passed)}" if passed else ""))
+    print("\nملاحظة: نِسب الدين هنا ليست حكماً شرعياً. قارنها بمصدرك.")
+    return 0
+
+
+def cmd_paper(args: argparse.Namespace) -> int:
+    """التشغيل الورقي: فتح، تسجيل جولة، أو عرض الحصيلة."""
+    conn = db.connect(args.db)
+    pp.ensure_schema(conn)
+
+    if args.start:
+        if pp.get_run(conn, args.name):
+            print(f"التشغيل '{args.name}' موجود مسبقاً.", file=sys.stderr)
+            return 1
+        run_id = pp.create_run(
+            conn, args.name, strategy="momentum", capital=args.capital,
+            params={"lookback": args.lookback, "hold": args.hold,
+                    "min_turnover": args.min_turnover,
+                    "quality_filter": args.quality},
+            notes=args.notes)
+        print(f"بدأ التشغيل الورقي '{args.name}' برقم {run_id}.")
+        print(f"رأس المال {args.capital:,.0f} ريال · {args.hold} أسهم · "
+              f"نظرة {args.lookback} جلسة"
+              + (" · مع مرشّح الجودة" if args.quality else ""))
+        return 0
+
+    run = pp.get_run(conn, args.name)
+    if not run:
+        print(f"لا يوجد تشغيل باسم '{args.name}'. ابدأه بـ --start.",
+              file=sys.stderr)
+        return 1
+    run_id = int(run["id"])
+
+    if args.record:
+        from .providers.yahoo import YahooProvider
+        picks = mo.current_picks(conn, args.lookback, args.hold * 3,
+                                 args.min_turnover)
+        selected = []
+        for holding in picks:
+            if len(selected) >= args.hold:
+                break
+            if args.quality:
+                quality = fu.score(conn, holding.symbol)
+                if quality.has_enough_data and quality.failures():
+                    continue
+            selected.append(holding)
+
+        if not selected:
+            print("لم تُنتج أي اختيارات.", file=sys.stderr)
+            return 1
+
+        quotes = YahooProvider().get_quotes([h.symbol for h in selected])
+        today = date.today().isoformat()
+        decisions = []
+        for rank, holding in enumerate(selected, 1):
+            quote = quotes.get(holding.symbol)
+            if not quote:
+                continue
+            company = u.get_company(conn, holding.symbol)
+            decisions.append(pp.Decision(
+                symbol=holding.symbol, action="BUY",
+                price_at_decision=quote.price, rank=rank,
+                score=holding.score, weight=1.0 / len(selected),
+                rationale_ar=(f"قوة نسبية {holding.score * 100:+.1f}% خلال "
+                              f"{args.lookback} جلسة · سيولة "
+                              f"{holding.turnover / 1e6:.0f}م"),
+                features={"turnover": holding.turnover,
+                          "name": (company.name_ar if company else "")}))
+        written = pp.record_decisions(conn, run_id, today, decisions)
+        print(f"سُجِّل {written} قراراً لتاريخ {today}.")
+        if written < len(decisions):
+            print(f"({len(decisions) - written} كان مسجّلاً مسبقاً ولم يُكتب فوقه.)")
+        _print_table(
+            [[d.rank, d.symbol, d.features.get("name", ""),
+              f"{d.price_at_decision:.2f}", f"{d.score * 100:+.1f}%"]
+             for d in decisions],
+            ["#", "الرمز", "الشركة", "سعر القرار", "قوة نسبية"])
+        return 0
+
+    if args.log:
+        entries = pp.decision_log(conn, args.name, limit=args.limit)
+        if not entries:
+            print("لا قرارات مسجّلة بعد.")
+            return 0
+        _print_table(
+            [[e["as_of_date"], e["symbol"], e["rank"],
+              f"{e['price_at_decision']:.2f}",
+              f"{e['exit_price']:.2f}" if e["exit_price"] else "قائم",
+              f"{e['return_pct']:+.2f}%" if e["return_pct"] is not None else "—"]
+             for e in entries],
+            ["التاريخ", "الرمز", "#", "سعر الدخول", "سعر الخروج", "العائد"])
+        return 0
+
+    summary = pp.summarise(conn, args.name)
+    print(summary.render_ar())
+    return 0
+
+
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -826,6 +973,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--benchmark", default="TASI")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("fundamentals", help="القوائم المالية وفحص الجودة")
+    p.add_argument("--fetch", action="store_true", help="اجلب القوائم من المصدر")
+    p.add_argument("--symbols", nargs="*", default=None)
+    p.add_argument("--lookback", type=int, default=mo.DEFAULT_LOOKBACK)
+    p.add_argument("--hold", type=int, default=15)
+    p.add_argument("--min-turnover", type=float, default=mo.DEFAULT_MIN_TURNOVER,
+                   dest="min_turnover")
+    p.add_argument("--max-debt", type=float, default=2.0, dest="max_debt")
+    p.set_defaults(func=cmd_fundamentals)
+
+    p = sub.add_parser("paper", help="التشغيل الورقي الحي")
+    p.add_argument("--name", default="momentum-live")
+    p.add_argument("--start", action="store_true", help="ابدأ تشغيلاً جديداً")
+    p.add_argument("--record", action="store_true", help="سجّل جولة اليوم")
+    p.add_argument("--log", action="store_true", help="اعرض سجل القرارات")
+    p.add_argument("--capital", type=float, default=1000.0)
+    p.add_argument("--hold", type=int, default=10)
+    p.add_argument("--lookback", type=int, default=mo.DEFAULT_LOOKBACK)
+    p.add_argument("--min-turnover", type=float, default=mo.DEFAULT_MIN_TURNOVER,
+                   dest="min_turnover")
+    p.add_argument("--quality", action="store_true", help="طبّق مرشّح الجودة")
+    p.add_argument("--notes", default="")
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=cmd_paper)
 
     p = sub.add_parser("momentum", help="الزخم المقطعي: اختبار أو ترتيب حالي")
     p.add_argument("--lookback", type=int, default=mo.DEFAULT_LOOKBACK)
