@@ -20,24 +20,26 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import json
+import os
 import sys
 from datetime import date, datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from . import backtest as bt
+from . import checkpoint as ck
 from . import db
 from . import engine as eng
 from . import forward as fw
 from . import fundamentals as fu
 from . import journal as jr
-from . import paper as pp
 from . import momentum as mo
+from . import paper as pp
 from . import quality as ql
 from . import regime as rg
-from . import sweep as sw
 from . import setups as S
+from . import sweep as sw
 from . import universe as u
 from .risk import RiskManager
 
@@ -938,6 +940,32 @@ def cmd_shariah_us(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_checkpoint(args: argparse.Namespace) -> int:
+    """ثبّت الحالة الحرجة إلى git، أو استعدها بعد بيئة جديدة."""
+    conn = db.connect(args.db)
+    ck_path = args.path or f"snapshots/{Path(args.db).stem}.json"
+
+    if args.restore:
+        if not Path(ck_path).exists():
+            print(f"لا يوجد تثبيت في {ck_path}.", file=sys.stderr)
+            return 1
+        counts = ck.import_all(conn, ck_path, mode=args.mode)
+        print(f"استُعيد من {ck_path}:")
+        for table, count in counts.items():
+            if count:
+                print(f"  {table}: {count}")
+        return 0
+
+    counts = ck.export_all(conn, ck_path)
+    print(f"تم التثبيت في {ck_path}:")
+    for table, count in counts.items():
+        if count:
+            print(f"  {table}: {count}")
+    print("\nلا تنسَ: git add/commit/push حتى ينجو من إعادة تدوير البيئة.")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1055,6 +1083,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--notes", default="")
     p.add_argument("--limit", type=int, default=50)
     p.set_defaults(func=cmd_paper)
+
+    p = sub.add_parser("checkpoint", help="ثبّت الحالة الحرجة أو استعدها من git")
+    p.add_argument("--path", default=None, help="افتراضياً snapshots/<اسم القاعدة>.json")
+    p.add_argument("--restore", action="store_true")
+    p.add_argument("--mode", choices=["ignore", "replace"], default="ignore",
+                   help="عند الاستعادة: ignore يحافظ على الموجود، replace يستبدله")
+    p.set_defaults(func=cmd_checkpoint)
 
     p = sub.add_parser("shariah-us", help="استورد التصنيف الشرعي الأمريكي من بيت العربي")
     p.add_argument("--pages", type=int, default=21)
