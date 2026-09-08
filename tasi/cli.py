@@ -24,11 +24,12 @@ import os
 import json
 import sys
 from datetime import date, datetime
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from . import backtest as bt
 from . import db
 from . import engine as eng
+from . import forward as fw
 from . import journal as jr
 from . import quality as ql
 from . import regime as rg
@@ -563,6 +564,71 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_forward(args: argparse.Namespace) -> int:
+    """اختبار تقدّمي بمحفظة واحدة: يقيس نسبة الخطأ والخسارة قبل أي إطلاق."""
+    conn = db.connect(args.db)
+
+    symbols = args.symbols or u.all_symbols(conn)
+    if args.market:
+        rows = conn.execute("SELECT symbol FROM companies WHERE market = ?",
+                            (args.market,)).fetchall()
+        allowed = {r["symbol"] for r in rows}
+        symbols = [s for s in symbols if s in allowed]
+    if args.shariah:
+        allowed = set(u.filter_by_shariah(conn, args.shariah))
+        symbols = [s for s in symbols if s in allowed]
+    if args.limit_symbols:
+        symbols = symbols[:args.limit_symbols]
+
+    weights = None
+    if not args.allow_uncalibrated:
+        rows = conn.execute(
+            "SELECT setup, regime, weight FROM setup_performance").fetchall()
+        weights = {(r["setup"], r["regime"]): float(r["weight"] or 0) for r in rows}
+        if not any(weights.values()):
+            print("لا يوجد نمط بوزن موجب، فلن تُفتح أي صفقة.", file=sys.stderr)
+            print("أضف --allow-uncalibrated لرؤية ما كان سيحدث فعلاً.\n",
+                  file=sys.stderr)
+
+    print(f"اختبار تقدّمي على {len(symbols)} سهماً برأس مال "
+          f"{args.capital:,.0f} ريال...\n")
+
+    def progress(day, total, equity):
+        print(f"  {day}/{total} جلسة · رأس المال {equity:,.0f} ريال")
+
+    try:
+        report = fw.run_forward(
+            conn, symbols, capital=args.capital, benchmark=args.benchmark,
+            weights=weights, max_hold_days=args.max_hold,
+            min_score=args.min_score, max_open=args.max_open,
+            commission_pct=args.commission / 100,
+            risk_per_trade=args.risk / 100,
+            allow_uncalibrated=args.allow_uncalibrated,
+            on_progress=progress)
+    except ValueError as exc:
+        print(f"تعذّر التشغيل: {exc}", file=sys.stderr)
+        return 1
+
+    print()
+    print(report.render_ar())
+
+    if args.by_setup and report.trades:
+        by: Dict[str, List] = {}
+        for trade in report.trades:
+            by.setdefault(trade.setup, []).append(trade)
+        print("الأداء حسب النمط")
+        print("─" * 64)
+        _print_table(
+            [[S.SETUP_NAMES_AR.get(k, k), len(v),
+              f"{sum(1 for t in v if t.pnl > 0) / len(v):.0%}",
+              f"{sum(t.pnl for t in v):+,.0f}"]
+             for k, v in sorted(by.items(),
+                                key=lambda kv: -sum(t.pnl for t in kv[1]))],
+            ["النمط", "صفقات", "نسبة الربح", "صافي الريالات"])
+    return 0
+
+
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -645,6 +711,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--benchmark", default="TASI")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("forward", help="اختبار تقدّمي بمحفظة: نسبة الخطأ والخسارة")
+    p.add_argument("--symbols", nargs="*", default=None)
+    p.add_argument("--market", default="MAIN")
+    p.add_argument("--shariah", nargs="*", default=None)
+    p.add_argument("--limit-symbols", type=int, default=None, dest="limit_symbols")
+    p.add_argument("--capital", type=float, default=100_000.0)
+    p.add_argument("--benchmark", default="TASI")
+    p.add_argument("--max-hold", type=int, default=15, dest="max_hold")
+    p.add_argument("--min-score", type=float, default=50.0, dest="min_score")
+    p.add_argument("--max-open", type=int, default=5, dest="max_open")
+    p.add_argument("--commission", type=float, default=0.155)
+    p.add_argument("--risk", type=float, default=1.0,
+                   help="نسبة المخاطرة لكل صفقة بالمئة")
+    p.add_argument("--allow-uncalibrated", action="store_true",
+                   dest="allow_uncalibrated")
+    p.add_argument("--by-setup", action="store_true", dest="by_setup")
+    p.set_defaults(func=cmd_forward)
 
     p = sub.add_parser("sweep", help="مسح معاملات الأنماط مع تحقق خارج العيّنة")
     p.add_argument("--setups", nargs="*", default=None)
