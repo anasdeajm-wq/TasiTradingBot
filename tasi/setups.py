@@ -265,7 +265,10 @@ class MeanReversion(Setup):
         score = 45.0 + min(30.0, depth_bonus)
 
         stop = snap.close - snap.atr * p["atr_stop_mult"]
-        target = snap.ma20 if snap.ma20 else snap.close + snap.atr * p["atr_target_mult"]
+        # الهدف الطبيعي للارتداد هو المتوسط، لكن معامل ATR يبقى سقفاً
+        # فعّالاً: بدونه يصبح المعامل بلا أثر ويضخّم شبكة المسح بتكرار.
+        atr_target = snap.close + snap.atr * p["atr_target_mult"]
+        target = min(snap.ma20, atr_target) if snap.ma20 else atr_target
         return self._match(
             snap, score,
             f"تشبع بيع RSI {snap.rsi:.0f} عند النطاق السفلي "

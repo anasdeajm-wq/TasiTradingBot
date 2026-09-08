@@ -32,6 +32,8 @@ from . import engine as eng
 from . import journal as jr
 from . import quality as ql
 from . import regime as rg
+from . import sweep as sw
+from . import setups as S
 from . import universe as u
 from .risk import RiskManager
 
@@ -480,6 +482,87 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 0 if saved else 1
 
 
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    """امسح معاملات نمط وقيّم كل تركيبة خارج العيّنة."""
+    conn = db.connect(args.db)
+
+    symbols = args.symbols or u.all_symbols(conn)
+    if args.market:
+        rows = conn.execute("SELECT symbol FROM companies WHERE market = ?",
+                            (args.market,)).fetchall()
+        allowed = {r["symbol"] for r in rows}
+        symbols = [s for s in symbols if s in allowed]
+    if args.limit_symbols:
+        symbols = symbols[:args.limit_symbols]
+
+    names = args.setups or list(sw.DEFAULT_GRIDS)
+    print(f"مسح {len(names)} نمطاً على {len(symbols)} سهماً.\n")
+
+    overall_tested = 0
+    overall_survivors = []
+    overall_expected = 0.0
+
+    for name in names:
+        try:
+            cls = sw.setup_class_by_name(name)
+        except ValueError as exc:
+            print(f"تخطي: {exc}", file=sys.stderr)
+            continue
+        grid = sw.DEFAULT_GRIDS.get(name, {})
+        combos = len(sw.expand_grid(grid))
+        print(f"── {S.SETUP_NAMES_AR.get(name, name)} · {combos} تركيبة ──")
+
+        def progress(i, total, survivors):
+            if i % 10 == 0 or i == total:
+                print(f"   {i}/{total} · ناجون {survivors}")
+
+        report = sw.sweep(conn, cls, grid, symbols, benchmark=args.benchmark,
+                          max_bars=args.max_bars,
+                          min_trades_each=args.min_trades,
+                          train_fraction=args.train_fraction,
+                          on_progress=progress)
+        overall_tested += report.combinations_tested
+        overall_survivors += report.survivors
+        overall_expected += report.expected_by_chance
+
+        print(f"   {report.verdict_ar()}")
+        top = report.results[:args.top]
+        if top:
+            _print_table(
+                [[r.to_row()["الحالة"], r.to_row()["المعاملات"],
+                  r.train_trades,
+                  f"{r.train_expectancy:+.3f}" if r.train_expectancy is not None else "—",
+                  r.test_trades,
+                  f"{r.test_expectancy:+.3f}" if r.test_expectancy is not None else "—",
+                  "نعم" if r.survived else "لا"] for r in top],
+                ["الحالة", "المعاملات", "تدريب", "توقع تدريب",
+                 "تحقق", "توقع تحقق", "صمد"])
+        print()
+
+    # الفرضية الصفرية مجموعة من تقديرات كل نمط على حدة، لا رقم مفترض،
+    # حتى لا يتناقض الملخص مع أحكام الأنماط أعلاه.
+    found = len(overall_survivors)
+    print("═" * 66)
+    print(f"إجمالي التركيبات المختبَرة : {overall_tested}")
+    print(f"الناجون                    : {found}")
+    print(f"المتوقع بالصدفة وحدها      : {overall_expected:.1f}")
+    print(f"عتبة القبول بعد الهامش     : "
+          f"{overall_expected * sw.SweepReport.CHANCE_MARGIN:.1f}")
+
+    if not overall_tested:
+        print("\nالحكم: لم تُنتج أي تركيبة صفقات كافية للحكم.")
+    elif found == 0:
+        print("\nالحكم: لا ناجي. لا أفضلية في فضاء المعاملات المجرَّب.")
+    elif found <= overall_expected * sw.SweepReport.CHANCE_MARGIN:
+        print(f"\nالحكم: {found} ناجٍ مقابل {overall_expected:.1f} متوقعة بالصدفة. "
+              "الفارق ضمن الضجيج، ولا يصلح للتشغيل.")
+    else:
+        print(f"\nالحكم: {found} ناجٍ مقابل {overall_expected:.1f} متوقعة بالصدفة. "
+              "مرشّح يستحق تحققاً متدحرجاً على فترات متعددة قبل أي تشغيل.")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -562,6 +645,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--benchmark", default="TASI")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("sweep", help="مسح معاملات الأنماط مع تحقق خارج العيّنة")
+    p.add_argument("--setups", nargs="*", default=None)
+    p.add_argument("--symbols", nargs="*", default=None)
+    p.add_argument("--market", default=None, help="MAIN أو NOMU")
+    p.add_argument("--limit-symbols", type=int, default=None, dest="limit_symbols")
+    p.add_argument("--benchmark", default="TASI")
+    p.add_argument("--max-bars", type=int, default=15, dest="max_bars")
+    p.add_argument("--min-trades", type=int, default=30, dest="min_trades")
+    p.add_argument("--train-fraction", type=float, default=0.6, dest="train_fraction")
+    p.add_argument("--top", type=int, default=8)
+    p.set_defaults(func=cmd_sweep)
 
     for name, helptext, func in (
         ("preflight", "فحص جاهزية النظام قبل الجلسة", cmd_preflight),
