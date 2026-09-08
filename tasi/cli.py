@@ -887,6 +887,33 @@ def cmd_paper(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_shariah_us(args: argparse.Namespace) -> int:
+    """اجلب وتحقّق واستورد التصنيف الشرعي الأمريكي من بيت العربي."""
+    from .providers import bitarabi as ba
+
+    conn = db.connect(args.db)
+    print(f"جلب أسهم {ba.BASE} ({args.pages} صفحة) والتحقق من كل حكم...")
+
+    def progress(i, n):
+        print(f"  تحقّق {i}/{n}")
+
+    results = ba.screen_all(pages=args.pages, on_progress=progress)
+    print(f"\nأحكام موثوقة: {len(results)}")
+
+    counts = ba.import_into(conn, results)
+    print(f"تم الاستيراد بمصدر: {ba.SOURCE_NAME}")
+    for status, count in counts.items():
+        print(f"  {u.STATUS_AR[status]}: {count}")
+
+    report = u.coverage_report(conn, ba.SOURCE_NAME)
+    print(f"\nتغطية الكون: {report['coverage_pct']}% "
+          f"({report['verified']}/{report['total_companies']})")
+    print("\n⚠ فحص آلي دون مراجعة بشرية، يطبّق فحصين من ثلاثة في معيار "
+          "AAOIFI فقط. راجع tasi/providers/bitarabi.py للتفاصيل الكاملة.")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -998,6 +1025,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--notes", default="")
     p.add_argument("--limit", type=int, default=50)
     p.set_defaults(func=cmd_paper)
+
+    p = sub.add_parser("shariah-us", help="استورد التصنيف الشرعي الأمريكي من بيت العربي")
+    p.add_argument("--pages", type=int, default=21)
+    p.set_defaults(func=cmd_shariah_us)
 
     p = sub.add_parser("momentum", help="الزخم المقطعي: اختبار أو ترتيب حالي")
     p.add_argument("--lookback", type=int, default=mo.DEFAULT_LOOKBACK)
