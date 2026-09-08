@@ -833,6 +833,43 @@ def cmd_paper(args: argparse.Namespace) -> int:
 
     if args.record:
         from .providers.yahoo import YahooProvider
+        provider = YahooProvider()
+
+        # أغلق أي قرارات سابقة قائمة قبل فتح دفعة جديدة - وإلا يبقى كل
+        # مركز "قائم" إلى الأبد ولا يتحقق الوعد الأصلي لهذا التشغيل:
+        # مقارنة الورق بالسعر الفعلي بعد فترة إعادة التوازن.
+        pending = [r for r in pp.open_decisions(conn, run_id)
+                  if r["as_of_date"] != date.today().isoformat()]
+        if pending:
+            print(f"إغلاق {len(pending)} قراراً من دفعة سابقة بسعر اليوم...\n")
+            bench_bars = _load_bars(conn, args.benchmark)
+            bench_by_date = (dict(zip(bench_bars["ts"], bench_bars["close"]))
+                             if bench_bars else {})
+            exit_quotes = provider.get_quotes(
+                [r["symbol"] for r in pending] + [args.benchmark])
+            bench_exit = exit_quotes.get(args.benchmark)
+            resolved_rows = []
+            for row in pending:
+                quote = exit_quotes.get(row["symbol"])
+                if not quote:
+                    continue
+                bench_entry = bench_by_date.get(row["as_of_date"])
+                bench_return = None
+                if bench_entry and bench_exit:
+                    bench_return = ((bench_exit.price - bench_entry)
+                                    / bench_entry * 100)
+                result = pp.resolve(conn, row["id"], quote.price,
+                                    benchmark_return_pct=bench_return)
+                resolved_rows.append((row["symbol"], row["as_of_date"],
+                                      result["return_pct"],
+                                      result["excess_pct"]))
+            _print_table(
+                [[sym, d, f"{r:+.2f}%",
+                  f"{ex:+.2f}%" if ex is not None else "—"]
+                 for sym, d, r, ex in resolved_rows],
+                ["الرمز", "دخل بتاريخ", "العائد", "مقابل المؤشر"])
+            print()
+
         picks = mo.current_picks(conn, args.lookback, args.hold * 3,
                                  args.min_turnover, market=args.market,
                                  benchmark_symbol=args.benchmark)
@@ -858,7 +895,7 @@ def cmd_paper(args: argparse.Namespace) -> int:
             print("لم تُنتج أي اختيارات.", file=sys.stderr)
             return 1
 
-        quotes = YahooProvider().get_quotes([h.symbol for h in selected])
+        quotes = provider.get_quotes([h.symbol for h in selected])
         today = date.today().isoformat()
         decisions = []
         for rank, holding in enumerate(selected, 1):
