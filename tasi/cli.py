@@ -978,6 +978,38 @@ def cmd_shariah_us(args: argparse.Namespace) -> int:
 
 
 
+def cmd_shariah_osaimi(args: argparse.Namespace) -> int:
+    """اجلب واستورد التصنيف الشرعي السعودي (تاسي+نمو) من أرقام - معيار العصيمي."""
+    from .providers import argaam_shariah as ag
+
+    conn = db.connect(args.db)
+    markets = ["MAIN", "NOMU"] if args.market == "ALL" else [args.market]
+    print(f"جلب قائمة العصيمي من أرقام لأسواق: {', '.join(markets)}...")
+
+    session = ag._session()
+    results = ag.screen_osaimi(markets=markets, session=session)
+    print(f"أسهم بمبلغ تطهير فعلي: {len(results)}")
+
+    corroboration = {}
+    if not args.no_corroboration:
+        for inst in ("alrajhi", "albilad"):
+            print(f"جلب قائمة {ag.INSTITUTION_NAMES_AR[inst]} للتوافق...")
+            corroboration[inst] = ag.fetch_compliant_symbols(
+                inst, markets=markets, session=session)
+
+    counts = ag.import_into(conn, results, corroboration=corroboration)
+    print(f"\nتم الاستيراد بمصدر: {ag.SOURCE_NAME}")
+    for status, count in counts.items():
+        print(f"  {u.STATUS_AR[status]}: {count}")
+
+    report = u.coverage_report(conn, ag.SOURCE_NAME)
+    print(f"\nتغطية الكون: {report['coverage_pct']}% "
+          f"({report['verified']}/{report['total_companies']})")
+    print("\n⚠ هذا تصنيف مصدر خارجي (أرقام، معيار العصيمي) مؤرَّخ - ليس فتوى من "
+          "هذا النظام. راجع tasi/providers/argaam_shariah.py للتفاصيل.")
+    return 0
+
+
 def cmd_checkpoint(args: argparse.Namespace) -> int:
     """ثبّت الحالة الحرجة إلى git، أو استعدها بعد بيئة جديدة."""
     conn = db.connect(args.db)
@@ -1131,6 +1163,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("shariah-us", help="استورد التصنيف الشرعي الأمريكي من بيت العربي")
     p.add_argument("--pages", type=int, default=21)
     p.set_defaults(func=cmd_shariah_us)
+
+    p = sub.add_parser("shariah-osaimi",
+                       help="استورد التصنيف الشرعي السعودي من أرقام - معيار العصيمي")
+    p.add_argument("--market", choices=["MAIN", "NOMU", "ALL"], default="ALL")
+    p.add_argument("--no-corroboration", action="store_true",
+                   help="تخطَّ جلب قائمتي الراجحي/البلاد للتوثيق التوافقي")
+    p.set_defaults(func=cmd_shariah_osaimi)
 
     p = sub.add_parser("momentum", help="الزخم المقطعي: اختبار أو ترتيب حالي")
     p.add_argument("--lookback", type=int, default=mo.DEFAULT_LOOKBACK)
