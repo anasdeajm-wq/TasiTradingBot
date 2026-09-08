@@ -31,6 +31,7 @@ from . import db
 from . import engine as eng
 from . import forward as fw
 from . import journal as jr
+from . import momentum as mo
 from . import quality as ql
 from . import regime as rg
 from . import sweep as sw
@@ -629,6 +630,92 @@ def cmd_forward(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_momentum(args: argparse.Namespace) -> int:
+    """الزخم المقطعي: اختبار تاريخي أو الترتيب الحالي."""
+    conn = db.connect(args.db)
+
+    if args.picks:
+        try:
+            picks = mo.current_picks(conn, lookback=args.lookback, hold=args.hold,
+                                     min_turnover=args.min_turnover,
+                                     market=args.market)
+        except ValueError as exc:
+            print(f"تعذّر: {exc}", file=sys.stderr)
+            return 1
+        if not picks:
+            print("لا توجد أسهم مطابقة لشروط السيولة.", file=sys.stderr)
+            return 1
+        print(f"الترتيب الحالي · نظرة {args.lookback} جلسة · "
+              f"سيولة ≥ {args.min_turnover / 1e6:.0f}م ريال\n")
+        _print_table(
+            [[i, h.symbol,
+              (u.get_company(conn, h.symbol).name_ar
+               if u.get_company(conn, h.symbol) else ""),
+              f"{h.score * 100:+.1f}%", f"{h.turnover / 1e6:.1f}م"]
+             for i, h in enumerate(picks, 1)],
+            ["#", "الرمز", "الشركة", "قوة نسبية", "سيولة يومية"])
+        print("\nهذه نتيجة نموذج لم يُشغَّل بمال حقيقي بعد. راجع تنبيه "
+              "تحيّز البقاء في tasi/momentum.py قبل أي قرار.")
+        return 0
+
+    try:
+        result = mo.run(conn, lookback=args.lookback, hold=args.hold,
+                        min_turnover=args.min_turnover, slippage=args.slippage,
+                        market=args.market)
+    except ValueError as exc:
+        print(f"تعذّر: {exc}", file=sys.stderr)
+        return 1
+
+    if not result.periods:
+        print("لم تُنتج أي فترة إعادة توازن.", file=sys.stderr)
+        return 1
+
+    print("═" * 60)
+    print(f"الزخم المقطعي · نظرة {args.lookback} · {args.hold} أسهم · "
+          f"سيولة ≥ {args.min_turnover / 1e6:.0f}م · انزلاق {args.slippage:.1%}")
+    print("═" * 60)
+    print(f"  عائد المحفظة   : {result.total_return_pct:>+10.1f}%")
+    print(f"  عائد المؤشر    : {result.benchmark_return_pct:>+10.1f}%")
+    print(f"  الفارق         : {result.excess_pct:>+10.1f}%")
+    annual = result.annualised()
+    if annual is not None:
+        print(f"  عائد سنوي      : {annual:>+10.2f}%")
+    print(f"  أقصى تراجع     : {result.max_drawdown_pct():>10.1f}%")
+    rate = result.win_rate()
+    if rate is not None:
+        print(f"  فترات رابحة    : {rate:>10.0%}")
+    worst = result.worst_period()
+    if worst:
+        print(f"  أسوأ فترة      : {worst[1] * 100:>+10.1f}%  ({worst[0][:7]})")
+    print(f"  فترات          : {result.periods:>10}")
+
+    if args.by_year:
+        print("\nالأداء السنوي")
+        print("─" * 60)
+        for year, value in sorted(result.by_year().items()):
+            print(f"  {year}: {value:>+8.1f}%")
+
+    if args.validate:
+        half = len(result.rebalances) // 2
+        train = mo.run(conn, lookback=args.lookback, hold=args.hold,
+                       min_turnover=args.min_turnover, slippage=args.slippage,
+                       market=args.market, end=half)
+        test = mo.run(conn, lookback=args.lookback, hold=args.hold,
+                      min_turnover=args.min_turnover, slippage=args.slippage,
+                      market=args.market, start=half)
+        print("\nالتحقق خارج العيّنة")
+        print("─" * 60)
+        print(f"  تدريب : فارق {train.excess_pct:+.1f}% على {train.periods} فترة")
+        print(f"  تحقق  : فارق {test.excess_pct:+.1f}% على {test.periods} فترة")
+        survived = train.excess_pct > 0 and test.excess_pct > 0
+        print(f"  الحكم : {'صمد' if survived else 'سقط'}")
+
+    print("\n⚠ الكون يضم الشركات المدرجة اليوم فقط. الشركات المشطوبة غائبة،")
+    print("  وغيابها يجمّل النتيجة. اخصم ذلك من أي رقم أعلاه.")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -711,6 +798,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--benchmark", default="TASI")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("momentum", help="الزخم المقطعي: اختبار أو ترتيب حالي")
+    p.add_argument("--lookback", type=int, default=mo.DEFAULT_LOOKBACK)
+    p.add_argument("--hold", type=int, default=mo.DEFAULT_HOLD)
+    p.add_argument("--min-turnover", type=float, default=mo.DEFAULT_MIN_TURNOVER,
+                   dest="min_turnover")
+    p.add_argument("--slippage", type=float, default=mo.DEFAULT_SLIPPAGE)
+    p.add_argument("--market", default="MAIN")
+    p.add_argument("--picks", action="store_true",
+                   help="اعرض الترتيب الحالي بدل الاختبار التاريخي")
+    p.add_argument("--by-year", action="store_true", dest="by_year")
+    p.add_argument("--validate", action="store_true",
+                   help="قسّم زمنياً وتحقق خارج العيّنة")
+    p.set_defaults(func=cmd_momentum)
 
     p = sub.add_parser("forward", help="اختبار تقدّمي بمحفظة: نسبة الخطأ والخسارة")
     p.add_argument("--symbols", nargs="*", default=None)
