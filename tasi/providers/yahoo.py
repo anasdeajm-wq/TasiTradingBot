@@ -61,14 +61,21 @@ MAX_RETRIES = 4
 
 
 def to_yahoo(symbol: str) -> str:
-    """حوّل 2222 أو 2222.SR إلى صيغة ياهو."""
+    """حوّل رمز داخلي إلى صيغة ياهو.
+
+    رموز تداول رقمية بحتة (2222) تأخذ لاحقة .SR. أي رمز غير رقمي
+    (AAPL، BRK-B، SPY...) يُترك كما هو - هذا هو الشكل الذي يتوقعه ياهو
+    فعلاً للأسواق غير السعودية، ولا يصح افتراض .SR عليه.
+    """
     s = str(symbol).strip().upper()
-    if s.startswith("^"):
-        return s
     if s in ("TASI", "^TASI"):
         return INDEX_SYMBOL
+    if s.startswith("^"):
+        return s
     base = s.split(".")[0].split(":")[0]
-    return f"{base}{SUFFIX}"
+    if base.isdigit():
+        return f"{base}{SUFFIX}"
+    return base
 
 
 def from_yahoo(symbol: str) -> str:

@@ -116,5 +116,20 @@ class TestSummary:
         pp.record_decisions(conn, run_id, "2026-09-01", [decision("A")])
         assert "لم تُقيَّم" in pp.summarise(conn, "test-run").render_ar()
 
+    def test_currency_defaults_to_sar_when_market_unspecified(self, conn, run_id):
+        summary = pp.summarise(conn, "test-run")
+        assert summary.currency == "ريال"
+        assert "ريال" in summary.render_ar()
+
+    def test_us_market_run_reports_dollars(self, conn):
+        # الخطأ الذي وُجد: التقرير كان يطبع "ريال" دائماً حتى لصفقات
+        # أمريكية بالدولار، بصرف النظر عن سوق التشغيل الفعلي
+        pp.create_run(conn, "us-run", "momentum", 1000.0,
+                      params={"market": "US", "benchmark": "SPY"})
+        summary = pp.summarise(conn, "us-run")
+        assert summary.currency == "دولار"
+        assert "دولار" in summary.render_ar()
+        assert "ريال" not in summary.render_ar()
+
     def test_unknown_run_summarises_to_none(self, conn):
         assert pp.summarise(conn, "nope") is None

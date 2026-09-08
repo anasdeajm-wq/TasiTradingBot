@@ -98,12 +98,14 @@ class RunSummary:
     win_rate: Optional[float] = None
     equity: Optional[float] = None
     benchmark_equity: Optional[float] = None
+    currency: str = "ريال"          # يُحدَّد من سوق التشغيل عند الاستخلاص
 
     def render_ar(self) -> str:
         lines = [
             "═" * 62,
             f"التشغيل الورقي: {self.name}",
-            f"بدأ في {self.started_at} برأس مال {self.capital:,.0f} ريال",
+            f"بدأ في {self.started_at} برأس مال "
+            f"{self.capital:,.0f} {self.currency}",
             "═" * 62,
             f"  قرارات مسجّلة   : {self.decisions}",
             f"  مُقيَّمة        : {self.resolved}",
@@ -118,9 +120,10 @@ class RunSummary:
         else:
             lines.append("  لم تُقيَّم أي نتيجة بعد.")
         if self.equity is not None:
-            lines.append(f"  رأس المال      : {self.equity:,.2f} ريال")
+            lines.append(f"  رأس المال      : {self.equity:,.2f} {self.currency}")
         if self.benchmark_equity is not None:
-            lines.append(f"  المؤشر لو جلست : {self.benchmark_equity:,.2f} ريال")
+            lines.append(f"  المؤشر لو جلست : "
+                         f"{self.benchmark_equity:,.2f} {self.currency}")
         lines.append("═" * 62)
         return "\n".join(lines)
 
@@ -243,10 +246,16 @@ def summarise(conn: sqlite3.Connection, name: str) -> Optional[RunSummary]:
         WHERE d.run_id = ?
         """, (run_id,)).fetchall()
 
+    try:
+        run_params = json.loads(run["params"] or "{}")
+    except (TypeError, ValueError):
+        run_params = {}
+    currency = "دولار" if run_params.get("market") == "US" else "ريال"
+
     summary = RunSummary(
         name=name, started_at=run["started_at"], capital=float(run["capital"]),
         decisions=total, resolved=len(outcomes),
-        open_decisions=total - len(outcomes))
+        open_decisions=total - len(outcomes), currency=currency)
 
     if outcomes:
         returns = [float(r["return_pct"]) for r in outcomes]

@@ -807,12 +807,19 @@ def cmd_paper(args: argparse.Namespace) -> int:
             conn, args.name, strategy="momentum", capital=args.capital,
             params={"lookback": args.lookback, "hold": args.hold,
                     "min_turnover": args.min_turnover,
-                    "quality_filter": args.quality},
+                    "quality_filter": args.quality,
+                    "market": args.market, "benchmark": args.benchmark,
+                    "shariah": args.shariah,
+                    "shariah_source": args.shariah_source},
             notes=args.notes)
+        currency = "دولار" if args.market == "US" else "ريال"
         print(f"بدأ التشغيل الورقي '{args.name}' برقم {run_id}.")
-        print(f"رأس المال {args.capital:,.0f} ريال · {args.hold} أسهم · "
+        print(f"سوق {args.market} · مؤشر {args.benchmark} · "
+              f"رأس المال {args.capital:,.0f} {currency} · {args.hold} أسهم · "
               f"نظرة {args.lookback} جلسة"
-              + (" · مع مرشّح الجودة" if args.quality else ""))
+              + (" · مع مرشّح الجودة" if args.quality else "")
+              + (f" · شرعي [{' '.join(args.shariah)}] عبر {args.shariah_source}"
+                 if args.shariah else ""))
         return 0
 
     run = pp.get_run(conn, args.name)
@@ -825,11 +832,20 @@ def cmd_paper(args: argparse.Namespace) -> int:
     if args.record:
         from .providers.yahoo import YahooProvider
         picks = mo.current_picks(conn, args.lookback, args.hold * 3,
-                                 args.min_turnover)
+                                 args.min_turnover, market=args.market,
+                                 benchmark_symbol=args.benchmark)
+
+        allowed_shariah = None
+        if args.shariah:
+            allowed_shariah = set(u.filter_by_shariah(
+                conn, args.shariah, source=args.shariah_source))
+
         selected = []
         for holding in picks:
             if len(selected) >= args.hold:
                 break
+            if allowed_shariah is not None and holding.symbol not in allowed_shariah:
+                continue
             if args.quality:
                 quality = fu.score(conn, holding.symbol)
                 if quality.has_enough_data and quality.failures():
@@ -848,15 +864,23 @@ def cmd_paper(args: argparse.Namespace) -> int:
             if not quote:
                 continue
             company = u.get_company(conn, holding.symbol)
+            shariah_note = ""
+            if allowed_shariah is not None:
+                status = u.get_shariah_status(conn, holding.symbol,
+                                              source=args.shariah_source)
+                shariah_note = f" · {status['status_ar']}"
+                if status["status"] == u.MIXED:
+                    shariah_note += " (يحتاج تطهيراً)"
             decisions.append(pp.Decision(
                 symbol=holding.symbol, action="BUY",
                 price_at_decision=quote.price, rank=rank,
                 score=holding.score, weight=1.0 / len(selected),
                 rationale_ar=(f"قوة نسبية {holding.score * 100:+.1f}% خلال "
                               f"{args.lookback} جلسة · سيولة "
-                              f"{holding.turnover / 1e6:.0f}م"),
+                              f"{holding.turnover / 1e6:.0f}م{shariah_note}"),
                 features={"turnover": holding.turnover,
-                          "name": (company.name_ar if company else "")}))
+                          "name": (company.name_ar or company.name_en
+                                   if company else "")}))
         written = pp.record_decisions(conn, run_id, today, decisions)
         print(f"سُجِّل {written} قراراً لتاريخ {today}.")
         if written < len(decisions):
@@ -1022,6 +1046,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-turnover", type=float, default=mo.DEFAULT_MIN_TURNOVER,
                    dest="min_turnover")
     p.add_argument("--quality", action="store_true", help="طبّق مرشّح الجودة")
+    p.add_argument("--market", default="MAIN", help="MAIN أو NOMU أو US")
+    p.add_argument("--benchmark", default="TASI", help="TASI للسعودي، SPY للأمريكي")
+    p.add_argument("--shariah", nargs="*", default=None,
+                   help="التصنيفات المسموحة، مثل: --shariah PURE MIXED")
+    p.add_argument("--shariah-source", default=None, dest="shariah_source",
+                   help="مصدر التصنيف الشرعي المعتمد للفلترة")
     p.add_argument("--notes", default="")
     p.add_argument("--limit", type=int, default=50)
     p.set_defaults(func=cmd_paper)
