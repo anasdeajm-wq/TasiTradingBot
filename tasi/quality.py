@@ -12,6 +12,7 @@ tasi/quality.py
     - قفزات سعرية تتجاوز حدود السوق المعقولة
     - أسعار غير منطقية (أعلى أقل من أدنى، أسعار صفرية أو سالبة)
     - فجوات وأحجام صفرية
+    - شموع مكررة حرفياً (نفس OHLCV) وهي عيب شائع في المصادر المجانية
 
 الحد اليومي في تداول ±10% للسوق الرئيسية، فأي حركة تتجاوز ذلك بوضوح
 إما تجزئة غير معدّلة أو بيانات فاسدة، لا حركة حقيقية.
@@ -120,7 +121,29 @@ def check_bars(symbol: str, bars: Dict[str, Sequence],
             f"أكبر حركة {report.max_move_pct:+.1f}% تتجاوز حد السوق الرئيسية "
             f"±{MAIN_MARKET_LIMIT_PCT:.0f}%")
 
-    # 4) أحجام صفرية
+    # 4) شموع مكررة حرفياً - عيب شائع في المصادر المجانية حين تُعاد
+    #    آخر شمعة بدل جلب الجديدة. تُنتج حجماً وهمياً وحركة صفرية.
+    if len(c) > 1 and o and h and l and v:
+        repeats = []
+        for i in range(1, len(c)):
+            same = (c[i] == c[i - 1] and o[i] == o[i - 1]
+                    and h[i] == h[i - 1] and l[i] == l[i - 1]
+                    and v[i] == v[i - 1] and v[i])
+            if same:
+                repeats.append(ts[i] if i < len(ts) else str(i))
+        if repeats:
+            share = len(repeats) / len(c)
+            message = (
+                f"{len(repeats)} شمعة مكررة حرفياً "
+                f"(نفس الفتح والأعلى والأدنى والإغلاق والحجم): "
+                f"{', '.join(repeats[:3])}"
+                f"{'...' if len(repeats) > 3 else ''}")
+            if share > 0.02:
+                report.add_error(message + ". بيانات غير موثوقة.")
+            else:
+                report.warnings.append(message)
+
+    # 5) أحجام صفرية
     if v:
         zero_volume = sum(1 for x in v if not x)
         if zero_volume > len(v) * 0.2:

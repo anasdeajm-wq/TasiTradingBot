@@ -23,7 +23,7 @@ import csv
 import os
 import json
 import sys
-from datetime import date
+from datetime import date, datetime
 from typing import List, Optional, Sequence
 
 from . import backtest as bt
@@ -261,9 +261,32 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     else:
         print(f"لا يوجد نمط بلغ {args.min_trades} صفقة على الأقل.")
 
+    # التحقق خارج العيّنة: الرقم الرابح داخل العيّنة لا يعني أفضلية.
+    verdicts = bt.validate(all_trades, train_fraction=args.train_fraction,
+                           min_trades_each=args.min_trades)
+    rows = bt.validation_report(verdicts, min_trades=args.min_trades)
+    if rows:
+        print("\n" + "─" * 70)
+        print("التحقق خارج العيّنة")
+        print("─" * 70)
+        _print_table(
+            [[r["النمط"], r["الحالة"], r["صفقات التدريب"],
+              f"{r['توقع التدريب']:+.3f}" if r["توقع التدريب"] is not None else "—",
+              r["صفقات التحقق"],
+              f"{r['توقع التحقق']:+.3f}" if r["توقع التحقق"] is not None else "—",
+              r["صمد"]] for r in rows],
+            ["النمط", "الحالة", "صفقات تدريب", "توقع تدريب",
+             "صفقات تحقق", "توقع تحقق", "صمد"])
+        survivors = [r for r in rows if r["صمد"] == "نعم"]
+        print(f"\nصمد {len(survivors)} من {len(rows)} تركيبة.")
+        if not survivors:
+            print("لا يوجد نمط له أفضلية مؤكدة. النظام لن يُنتج إشارات.")
+
     if args.save:
-        bt.save_performance(conn, stats)
-        print("\nتم حفظ الأوزان في setup_performance.")
+        bt.save_validated_performance(conn, all_trades,
+                                      train_fraction=args.train_fraction,
+                                      min_trades_each=args.min_trades)
+        print("\nتم الحفظ. الوزن الموجب يُمنح فقط لنمط صمد خارج العيّنة.")
     else:
         print("\n(لم تُحفظ الأوزان. أضف --save للحفظ.)")
     return 0
@@ -362,6 +385,101 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def _yahoo():
+    from .providers.yahoo import YahooProvider
+    return YahooProvider()
+
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    """اكتشف رموز تداول الموجودة فعلاً واحفظها في قاعدة البيانات."""
+    from .providers.yahoo import tadawul_candidates
+
+    conn = db.connect(args.db)
+    provider = _yahoo()
+    candidates = args.symbols or tadawul_candidates()
+    print(f"فحص {len(candidates)} رمزاً مرشحاً عبر ياهو... قد يستغرق دقائق.\n")
+
+    seen = []
+
+    def report(symbol: str, name: str) -> None:
+        seen.append(symbol)
+        if len(seen) % 25 == 0:
+            print(f"  وُجد {len(seen)} حتى الآن...")
+
+    found = provider.discover_symbols(candidates, on_found=report)
+    if not found:
+        print("لم يُعثر على أي رمز. تحقق من الاتصال.", file=sys.stderr)
+        return 1
+
+    companies = [
+        u.Company(symbol=e["symbol"], name_en=e["name_en"],
+                  market="NOMU" if e["symbol"].startswith("9") else "MAIN")
+        for e in found
+    ]
+    u.upsert_companies(conn, companies)
+    print(f"\nتم حفظ {len(companies)} شركة.")
+    print(f"  السوق الرئيسية: {sum(1 for c in companies if c.market == 'MAIN')}")
+    print(f"  السوق الموازية : {sum(1 for c in companies if c.market == 'NOMU')}")
+    return 0
+
+
+def cmd_fetch(args: argparse.Namespace) -> int:
+    """حمّل الشموع التاريخية من ياهو إلى قاعدة البيانات."""
+    conn = db.connect(args.db)
+    provider = _yahoo()
+
+    symbols = args.symbols or u.all_symbols(conn)
+    if args.benchmark not in symbols:
+        symbols = [args.benchmark] + list(symbols)
+    if not symbols:
+        print("لا توجد رموز. شغّل universe-discover أولاً.", file=sys.stderr)
+        return 1
+
+    print(f"جلب {len(symbols)} رمزاً بفاصل {args.interval}...\n")
+    saved = failed = flagged = 0
+    now = datetime.now().isoformat(timespec="seconds")
+
+    for i, symbol in enumerate(symbols, 1):
+        try:
+            bars = provider.get_bars(symbol, args.interval, limit=args.limit)
+        except Exception as exc:                          # noqa: BLE001
+            failed += 1
+            if args.verbose:
+                print(f"  {symbol}: فشل - {exc}")
+            continue
+
+        if not bars:
+            failed += 1
+            continue
+
+        rows = [(symbol, args.interval, b.ts.date().isoformat(),
+                 b.open, b.high, b.low, b.close, b.volume, None, None)
+                for b in bars]
+        conn.executemany(
+            "INSERT OR REPLACE INTO bars"
+            " (symbol, interval, ts, open, high, low, close, volume, turnover, trades)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        conn.commit()
+        saved += 1
+
+        series = {"ts": [r[2] for r in rows], "open": [r[3] for r in rows],
+                  "high": [r[4] for r in rows], "low": [r[5] for r in rows],
+                  "close": [r[6] for r in rows], "volume": [r[7] for r in rows]}
+        report = ql.check_bars(symbol, series)
+        if not report.ok:
+            flagged += 1
+            print(f"  ⚠ {report.summary_ar()}")
+
+        if i % 25 == 0:
+            print(f"  {i}/{len(symbols)}...")
+
+    print(f"\nتم حفظ {saved} رمزاً | فشل {failed} | فشل فحص الجودة {flagged}")
+    total = conn.execute("SELECT COUNT(*) c FROM bars").fetchone()["c"]
+    print(f"إجمالي الشموع في القاعدة: {total:,}")
+    return 0 if saved else 1
+
+
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -405,7 +523,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-bars", type=int, default=15, dest="max_bars")
     p.add_argument("--start", type=int, default=200,
                    help="عدد الشموع المحجوزة لتسخين المؤشرات")
-    p.add_argument("--min-trades", type=int, default=5, dest="min_trades")
+    p.add_argument("--min-trades", type=int, default=30, dest="min_trades")
+    p.add_argument("--train-fraction", type=float, default=0.6,
+                   dest="train_fraction",
+                   help="نسبة الصفقات المستخدمة للتدريب، والباقي للتحقق")
     p.add_argument("--ignore-regime", action="store_true", dest="ignore_regime")
     p.add_argument("--shariah", nargs="*", default=None,
                    help="اقصر القياس على تصنيفات شرعية، مثل: --shariah PURE MIXED")
@@ -429,6 +550,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--commission", type=float, default=0.155,
                    help="عمولة الوسيط بالنسبة المئوية لكل جهة")
     p.set_defaults(func=cmd_viability)
+
+    p = sub.add_parser("universe-discover", help="اكتشف رموز تداول من ياهو")
+    p.add_argument("--symbols", nargs="*", default=None)
+    p.set_defaults(func=cmd_discover)
+
+    p = sub.add_parser("fetch", help="حمّل الشموع التاريخية من ياهو")
+    p.add_argument("--symbols", nargs="*", default=None)
+    p.add_argument("--interval", default="1day")
+    p.add_argument("--limit", type=int, default=2600)
+    p.add_argument("--benchmark", default="TASI")
+    p.add_argument("--verbose", action="store_true")
+    p.set_defaults(func=cmd_fetch)
 
     for name, helptext, func in (
         ("preflight", "فحص جاهزية النظام قبل الجلسة", cmd_preflight),

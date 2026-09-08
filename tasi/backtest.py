@@ -281,3 +281,114 @@ def summary_report(stats: Dict[Tuple[str, str], SetupStats],
     """تقرير مرتّب بالتوقع، مع إخفاء العيّنات الصغيرة جداً."""
     rows = [s.to_dict() for s in stats.values() if s.trades >= min_trades]
     return sorted(rows, key=lambda r: r["التوقع"], reverse=True)
+
+# ---------------------------------------------------------------------------
+# التحقق خارج العيّنة - out-of-sample validation
+# ---------------------------------------------------------------------------
+def split_by_time(trades: Sequence[Trade], train_fraction: float = 0.6
+                  ) -> Tuple[List[Trade], List[Trade], str]:
+    """اقسم الصفقات زمنياً إلى تدريب وتحقق. يُرجع (تدريب، تحقق، تاريخ القطع)."""
+    ordered = sorted(trades, key=lambda t: t.entry_ts)
+    if len(ordered) < 10:
+        return list(ordered), [], ""
+    cut_index = int(len(ordered) * train_fraction)
+    cut_ts = ordered[cut_index].entry_ts
+    return ([t for t in ordered if t.entry_ts < cut_ts],
+            [t for t in ordered if t.entry_ts >= cut_ts], cut_ts)
+
+
+def validate(trades: Sequence[Trade], train_fraction: float = 0.6,
+             min_trades_each: int = 30) -> Dict[Tuple[str, str], Dict[str, object]]:
+    """هل تصمد أفضلية كل نمط على بيانات لم يُقس عليها؟
+
+    نمط يربح داخل العيّنة ويخسر خارجها ليس أفضلية بل ملاءمة زائدة. هذا
+    الفحص هو الفرق بين اكتشاف أفضلية واكتشاف رقم، ولا يُعطى وزن موجب
+    لأي نمط لم يجتزه.
+    """
+    train, test, cut = split_by_time(trades, train_fraction)
+    stats_train = aggregate(train)
+    stats_test = aggregate(test)
+
+    out: Dict[Tuple[str, str], Dict[str, object]] = {}
+    for key in set(stats_train) | set(stats_test):
+        a = stats_train.get(key)
+        b = stats_test.get(key)
+        enough = bool(a and b and a.trades >= min_trades_each
+                      and b.trades >= min_trades_each)
+        survived = bool(enough and a.expectancy > 0 and b.expectancy > 0)
+        out[key] = {
+            "setup": key[0], "regime": key[1], "cut_ts": cut,
+            "train_trades": a.trades if a else 0,
+            "train_expectancy": round(a.expectancy, 4) if a else None,
+            "test_trades": b.trades if b else 0,
+            "test_expectancy": round(b.expectancy, 4) if b else None,
+            "enough_data": enough,
+            "survived": survived,
+        }
+    return out
+
+
+def save_validated_performance(
+    conn: sqlite3.Connection,
+    trades: Sequence[Trade],
+    train_fraction: float = 0.6,
+    min_trades_each: int = 30,
+) -> Dict[Tuple[str, str], Dict[str, object]]:
+    """احفظ الأداء، لكن لا تمنح وزناً موجباً إلا لنمط صمد خارج العيّنة.
+
+    هذا هو الحارس الذي يمنع نشر نظام مُلائم زيادة. الأرقام كلها تُحفظ
+    للاطلاع، والوزن وحده هو ما يقرر إن كان النمط سيُنتج إشارات.
+    """
+    full = aggregate(trades)
+    verdicts = validate(trades, train_fraction, min_trades_each)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    for key, stats in full.items():
+        verdict = verdicts.get(key, {})
+        survived = bool(verdict.get("survived"))
+        test_expectancy = verdict.get("test_expectancy")
+
+        # الوزن يُشتق من الأداء خارج العيّنة لا من الأداء الكلي.
+        weight = 0.0
+        if survived and test_expectancy:
+            weight = max(0.0, min(2.0, float(test_expectancy) * 2.0))
+
+        conn.execute(
+            """
+            INSERT INTO setup_performance
+                (setup, regime, trades, wins, losses, gross_profit, gross_loss,
+                 avg_r, hit_rate, expectancy, weight, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(setup, regime) DO UPDATE SET
+                trades = excluded.trades, wins = excluded.wins,
+                losses = excluded.losses, gross_profit = excluded.gross_profit,
+                gross_loss = excluded.gross_loss, avg_r = excluded.avg_r,
+                hit_rate = excluded.hit_rate, expectancy = excluded.expectancy,
+                weight = excluded.weight, updated_at = excluded.updated_at
+            """,
+            (key[0], key[1], stats.trades, stats.wins, stats.losses,
+             stats.gross_profit, stats.gross_loss, stats.avg_r,
+             stats.hit_rate, stats.expectancy, weight, now),
+        )
+    conn.commit()
+    return verdicts
+
+
+def validation_report(verdicts: Dict[Tuple[str, str], Dict[str, object]],
+                      min_trades: int = 30) -> List[Dict[str, object]]:
+    """تقرير التحقق مرتّباً بأداء خارج العيّنة."""
+    rows = []
+    for verdict in verdicts.values():
+        if (verdict["train_trades"] or 0) < min_trades:
+            continue
+        rows.append({
+            "النمط": S.SETUP_NAMES_AR.get(verdict["setup"], verdict["setup"]),
+            "الحالة": rg.REGIME_AR.get(verdict["regime"], verdict["regime"]),
+            "صفقات التدريب": verdict["train_trades"],
+            "توقع التدريب": verdict["train_expectancy"],
+            "صفقات التحقق": verdict["test_trades"],
+            "توقع التحقق": verdict["test_expectancy"],
+            "صمد": "نعم" if verdict["survived"] else "لا",
+        })
+    return sorted(rows, key=lambda r: (r["توقع التحقق"] is None,
+                                       -(r["توقع التحقق"] or -99)))
